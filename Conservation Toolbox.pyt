@@ -215,4 +215,28 @@ class FindBursts(object):
             distance = self._calculate_distance(ordered_points)
             self._add_message(f"{_id} moved {round(distance/1000, 2)} kilometers")
 
- 
+        return
+
+    def _add_message(self, message):
+        # adds a message
+        arcpy.AddMessage(message)
+
+    # TODO: add typed arguments
+    def _calculate_distance(self, ordered_list):
+        """
+        Calculates distance in meters of the ordered list of point geometries
+        :param ordered_list: list of PointGeometry objects
+        :return: distance in meters
+        """
+
+        total_distance = 0
+        previous_point = None
+        for point in ordered_list:
+            if previous_point is not None:
+                angle, distance = previous_point.angleAndDistanceTo(point)  # geodesic distance in meters
+                total_distance += distance
+            previous_point = point
+
+        return total_distance
+
+
