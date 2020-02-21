@@ -1,12 +1,25 @@
 
 import arcpy
-#from tools import FindBursts --- this kind of import was not updating in ArcGIS Pro, grrr!
+from datetime import datetime, timedelta
+from dateutil.parser import parse
+import os
+import sys
+
+
+# TODO: only when distributing update this vvv
+# TODO: you can import these files once, but they don't refresh when developing...
+#tools_dir = os.path.join(os.path.dirname(__file__), 'tools')
+#sys.path.append(tools_dir)
+# Do not compile .pyc files for the tool modules.
+sys.dont_write_bytecode = True
+
+#from FindBursts import FindBursts
 
 
 class Toolbox(object):
     def __init__(self):
         self.label = "Conservation Toolbox"
-        self.alias = "ConservationToolbox"
+        self.alias = "Conservation Toolbox"
         self.tools = [FindBursts]
 
 
@@ -17,24 +30,27 @@ class FindBursts(object):
         self.canRunInBackground = False
         self.max_day_range = 60
         self.max_burst_period = self.max_day_range * 24
+        self.template_layer = os.path.join(os.path.dirname(__file__), "templates", "bursts_template.lyr")
 
     def getParameterInfo(self):
 
         input_layer = arcpy.Parameter(
-            displayName="Input Layer",
+            displayName="Input Layer!!!",
             name="input_layer",
             datatype="GPFeatureLayer",
             parameterType="Required",
             direction="Input")
-        input_layer.filter.list = ["POINT"]  # only point supported right, but could add polylines
+        input_layer.filter.list = ["POINT"]
+        input_layer.value = "garambaElephantsPosition"
 
         individual_field = arcpy.Parameter(
-            displayName="ID Field",
+            displayName="ID Field", # TODO: should only be string type
             name="individual_field",
             datatype="Field",
             parameterType="Required",
             direction="Input")
         individual_field.parameterDependencies = [input_layer.name]
+        individual_field.value = "Provider" # TODO: the value might be different from the database field name
 
         date_field = arcpy.Parameter(
             displayName="Date Field",
@@ -43,6 +59,7 @@ class FindBursts(object):
             parameterType="Required",
             direction="Input")
         date_field.parameterDependencies = [input_layer.name]
+        date_field.value = "Datetime of Last Signal"
 
         start_date = arcpy.Parameter(
             displayName="Start Date",
@@ -50,6 +67,7 @@ class FindBursts(object):
             datatype="GPDate",
             parameterType="Required",
             direction="Input")
+        start_date.value = "2020-02-17 9:55:58 AM"
 
         end_date = arcpy.Parameter(
             displayName="End Date",
@@ -57,6 +75,7 @@ class FindBursts(object):
             datatype="GPDate",
             parameterType="Required",
             direction="Input")
+        end_date.value = "2020-02-20 9:55:58 AM"
 
         burst_period = arcpy.Parameter(
             displayName="Burst Period (Hours)",
@@ -64,7 +83,7 @@ class FindBursts(object):
             datatype="GPLong",
             parameterType="Required",
             direction="Input")
-        burst_period.value = 24
+        burst_period.value = 36
 
         species = arcpy.Parameter(
             displayName="Species",
@@ -86,14 +105,6 @@ class FindBursts(object):
         subspecies.filter.list = []
         subspecies.value = "savannah" # temporary - savannah default to make testing faster
 
-        output_layer = arcpy.Parameter(
-            displayName="Output Layer",
-            name="out_layer",
-            datatype="GPFeatureLayer",
-            parameterType="Derived",
-            direction="Output")
-        output_layer.parameterDependencies = [input_layer.name]
-
         return [
             input_layer,
             individual_field,
@@ -103,7 +114,6 @@ class FindBursts(object):
             burst_period,
             species,
             subspecies,
-            output_layer
         ]
 
     def updateParameters(self, parameters):
@@ -162,58 +172,79 @@ class FindBursts(object):
 
     def execute(self, parameters, messages):
 
-        input_layer, id_field, date_field, start_date, end_date, burst_period, species, output_layer = (
+        input_layer, id_field, date_field, start_date, end_date, burst_period, species = (
             parameters[0].valueAsText,
             parameters[1].valueAsText,
             parameters[2].valueAsText,
             parameters[3].value,  # datetime
             parameters[4].value,  # datetime
-            parameters[5].valueAsText,
+            parameters[5].value,
             parameters[6].valueAsText,
-            parameters[7].valueAsText + ' (Bursts)'
         )
 
-        # print parameters
-        self._add_message(f'Input layer: {input_layer}')
-        self._add_message(f'ID field: {id_field}')
-        self._add_message(f'Date range: {str(start_date)} - {str(end_date)}')
-        self._add_message(f'Date field: {date_field}')
-        self._add_message(f'Burst period: {burst_period}')
-        self._add_message(f'Species: {species}')
-        self._add_message(f'Output layer: {output_layer}')
+        for param in parameters:
+            messages.addMessage(f"{param.name} = {param.valueAsText}")
 
-        # get project and active map
         aprx = arcpy.mp.ArcGISProject('CURRENT')
-        map = aprx.activeMap  # map.listLayers
+        mxd = aprx.activeMap
 
-        # get ordered points with date ranges
-        sql_clause = (None, f'ORDER BY {date_field} ASC')
-        where_clause = f'{date_field} BETWEEN TIMESTAMP \'{str(start_date)}\' AND TIMESTAMP \'{str(end_date)}\''
-        cursor = arcpy.da.SearchCursor(
-            input_layer,
-            field_names=[id_field, date_field, 'SHAPE@'],
-            sql_clause=sql_clause,
-            where_clause=where_clause
-        )
+        feature_class = self._create_bursts_feature_class()
+        layer = self._create_bursts_feature_layer(burst_period, species, feature_class)
 
-        # create dictionary of individuals and their points
-        individuals = dict()
-        for row in cursor:
-            _id, _datetime, geometry = row[0], row[1], row[2]
-            if _id not in individuals.keys():
-                individuals[_id] = list()
+        unique_ids = self._get_unique_ids(id_field, input_layer)
+        messages.addMessage(f'{unique_ids}')
 
-            individuals[_id].append({
-                'id': _id,
-                'datetime': _datetime,
-                'geometry': geometry,  # PointGeometry
-            })
+        id_to_max_length = dict()
 
-        # temporarily just testing distance calculations
-        for _id, points in individuals.items():
-            ordered_points = [p['geometry'] for p in points]
-            distance = self._calculate_distance(ordered_points)
-            self._add_message(f"{_id} moved {round(distance/1000, 2)} kilometers")
+        # loop through each individual
+        for _id in unique_ids:
+            messages.addMessage(f'_id: {_id}')
+
+            # get all positions between the start and end date
+            id_positions_cursor = self._get_id_positions_cursor(_id, start_date, end_date, date_field, id_field, input_layer)
+            for id_pos in id_positions_cursor:
+                # convert the start date to a datetime object
+                current_start_date, point = id_pos[1], id_pos[2]
+                if isinstance(current_start_date, str):
+                    current_start_date = parse(current_start_date)
+
+                current_end_date = current_start_date + timedelta(hours=burst_period)
+
+                # get positions between current position and burst time in the future
+                current_positions_cursor = self._get_id_positions_cursor(_id, current_start_date, current_end_date, date_field, id_field, input_layer)
+                positions = list()
+                points_array = arcpy.Array()
+                for row in current_positions_cursor:
+                    row_id, row_date, row_geometry = row[0], row[1], row[2]
+                    positions.append(row_geometry)
+                    points_array.add(row_geometry.firstPoint)
+
+                if points_array.count > 0:
+
+                    spatial_reference = arcpy.SpatialReference(4326)
+                    polyline = arcpy.Polyline(points_array, spatial_reference)
+
+                    if _id not in id_to_max_length.keys():
+                        id_to_max_length[_id] = {
+                            'distance': -1,
+                            'insert_row': list()
+                        }
+
+                    distance = round(self._calculate_distance(positions), 2)
+                    if distance > id_to_max_length[_id]['distance']:
+                        messages.addMessage(f'{_id} - new longest burst - {distance}')
+                        id_to_max_length[_id]['distance'] = distance
+                        id_to_max_length[_id]['insert_row'] = [polyline, _id, current_start_date, distance]
+
+                else:
+                    messages.addMessage('no positions')
+
+        insert_cursor = arcpy.da.InsertCursor(feature_class, ["SHAPE@", "Individual", "DatetimeStart", "DistanceKm"])
+        for _id, value in id_to_max_length.items():
+            if value['distance'] > 0:
+                insert_cursor.insertRow(value['insert_row'])
+
+        mxd.addLayer(layer)
 
         return
 
@@ -224,7 +255,7 @@ class FindBursts(object):
     # TODO: add typed arguments
     def _calculate_distance(self, ordered_list):
         """
-        Calculates distance in meters of the ordered list of point geometries
+        Calculates distance in meters of the ordered list of PointGeometry objects
         :param ordered_list: list of PointGeometry objects
         :return: distance in meters
         """
@@ -239,4 +270,47 @@ class FindBursts(object):
 
         return total_distance
 
+    def _create_bursts_feature_class(self):
 
+        fc = arcpy.CreateFeatureclass_management(arcpy.env.workspace, "Bursts", "Polyline", spatial_reference=4326)[0]
+        arcpy.AddField_management(fc, "Individual", "TEXT", field_length=200)
+        arcpy.AddField_management(fc, "DatetimeStart", "DATE")
+        arcpy.AddField_management(fc, "DistanceKm", "Double", field_precision=10, field_scale=2)
+        return fc
+
+    def _create_bursts_feature_layer(self, burst_period, species, feature_class):
+        return arcpy.MakeFeatureLayer_management(feature_class, f"{species.title()} Bursts - {burst_period} hours")[0]
+
+    def _get_unique_ids(self, id_field, input_layer):
+
+        # TODO: possible issue with alias
+        # TODO: testing
+        id_field = 'provider'
+
+        sql_clause = ('DISTINCT', f'ORDER BY {id_field} DESC')
+        cursor = arcpy.da.SearchCursor(
+            input_layer,
+            field_names=[id_field],
+            sql_clause=sql_clause,
+        )
+
+        unique_ids = [row[0] for row in cursor]
+        return unique_ids
+
+
+    def _get_id_positions_cursor(self, id, start_date, end_date, date_field, id_field, input_layer):
+
+        # TODO: testing!
+        date_field = 'lastsignal'
+        id_field = 'provider'
+
+        sql_clause = (None, f'ORDER BY {date_field} ASC')
+
+        # TODO: is BETWEEN inclusive?
+        where_clause = f'{id_field} = \'{id}\' AND {date_field} BETWEEN TIMESTAMP \'{str(start_date)}\' AND TIMESTAMP \'{str(end_date)}\''
+        return arcpy.da.SearchCursor(
+            input_layer,
+            field_names=[id_field, date_field, 'SHAPE@'],
+            sql_clause=sql_clause,
+            where_clause=where_clause
+        )
